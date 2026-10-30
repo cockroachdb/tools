@@ -546,9 +546,11 @@ func (s *Snapshot) PackageDiagnostics(ctx context.Context, ids ...PackageID) (ma
 		}
 	}
 	pre := func(_ int, ph *packageHandle) bool {
-		if diags, ok := filecache.GetOrFatal(diagnosticsKind, ph.key, decodeDiagnostics); ok {
+		// The memory cache is shared by views with different roots,
+		// so it holds the location-independent form.
+		if gobDiags, ok := filecache.GetOrFatal(diagnosticsKind, ph.key, diagnosticsCodec.Decode); ok {
 			collect(ph.loadDiagnostics)
-			collect(diags)
+			collect(fromGobDiagnostics(gobDiags, ph.localInputs.root))
 			return false
 		}
 		return true
@@ -610,7 +612,7 @@ func (s *Snapshot) MethodSets(ctx context.Context, ids ...PackageID) ([]*methods
 		if idx, ok := filecache.GetOrFatal(methodSetsKind, ph.key, func(data []byte) *methodsets.Index {
 			return methodsets.Decode(pkgPath, data)
 		}); ok {
-			indexes[i] = idx
+			indexes[i] = idx.Rename(ph.localInputs.root.decPath)
 			return false
 		}
 		return true
@@ -633,7 +635,7 @@ func (s *Snapshot) Tests(ctx context.Context, ids ...PackageID) ([]*testfuncs.In
 	indexes := make([]*testfuncs.Index, len(ids))
 	pre := func(i int, ph *packageHandle) bool {
 		if idx, ok := filecache.GetOrFatal(testsKind, ph.key, testfuncs.Decode); ok {
-			indexes[i] = idx
+			indexes[i] = idx.Rename(ph.localInputs.root.decURI)
 			return false
 		}
 		return true

@@ -86,6 +86,38 @@ func (index *Index) Encode() []byte {
 	return packageCodec.Encode(index.pkg)
 }
 
+// Rename returns an index in which each file name is replaced by
+// rename(name). It returns the receiver if no name changes; otherwise
+// the result shares all data but the string table with the receiver.
+func (index *Index) Rename(rename func(string) string) *Index {
+	var strs []string // copy of index.pkg.Strings, allocated on first change
+	renamed := make(map[int]bool)
+	renameFile := func(i int) {
+		if i == 0 || renamed[i] {
+			return // 0 => no position
+		}
+		renamed[i] = true
+		if name := rename(index.pkg.Strings[i]); name != index.pkg.Strings[i] {
+			if strs == nil {
+				strs = slices.Clone(index.pkg.Strings)
+			}
+			strs[i] = name
+		}
+	}
+	for _, mset := range index.pkg.MethodSets {
+		renameFile(mset.Posn.File)
+		for _, m := range mset.Methods {
+			renameFile(m.Posn.File)
+		}
+	}
+	if strs == nil {
+		return index
+	}
+	pkg := index.pkg
+	pkg.Strings = strs
+	return &Index{pkg: pkg, PkgPath: index.PkgPath}
+}
+
 // NewIndex returns a new index of method-set information for all
 // package-level types in the specified package.
 func NewIndex(enc *objectpath.Encoder, fset *token.FileSet, pkg *types.Package) *Index {

@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/types"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -31,6 +32,33 @@ func Decode(data []byte) *Index {
 // Encode encodes the receiver as gob-encoded data.
 func (index *Index) Encode() []byte {
 	return packageCodec.Encode(index.pkg)
+}
+
+// Rename returns an index in which each file URI is replaced by
+// rename(uri). It returns the receiver if no URI changes.
+func (index *Index) Rename(rename func(protocol.DocumentURI) protocol.DocumentURI) *Index {
+	var files []gobFile // copy of index.pkg.Files, allocated on first change
+	for i, file := range index.pkg.Files {
+		var tests []gobTest
+		for j, test := range file.Tests {
+			if uri := rename(test.Location.URI); uri != test.Location.URI {
+				if tests == nil {
+					tests = slices.Clone(file.Tests)
+				}
+				tests[j].Location.URI = uri
+			}
+		}
+		if tests != nil {
+			if files == nil {
+				files = slices.Clone(index.pkg.Files)
+			}
+			files[i].Tests = tests
+		}
+	}
+	if files == nil {
+		return index
+	}
+	return &Index{gobPackage{Files: files}}
 }
 
 func (index *Index) All() []Result {

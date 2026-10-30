@@ -41,13 +41,14 @@ func (s *Snapshot) Symbols(ctx context.Context, ids ...PackageID) ([]*symbols.Pa
 				return bug.Errorf("missing metadata for %q", id)
 			}
 
-			key, fhs, err := symbolKey(ctx, mp, s)
+			root := s.rootMapper()
+			key, fhs, err := symbolKey(ctx, mp, s, root)
 			if err != nil {
 				return err
 			}
 
 			if pkg, ok := filecache.GetOrFatal(symbolsKind, key, symbols.Decode); ok {
-				res[i] = pkg
+				res[i] = pkg.Rename(root.decURI)
 				return nil
 			}
 
@@ -59,7 +60,7 @@ func (s *Snapshot) Symbols(ctx context.Context, ids ...PackageID) ([]*symbols.Pa
 
 			// Store the resulting data in the cache.
 			go func() {
-				data := pkg.Encode()
+				data := pkg.Rename(root.encURI).Encode()
 				if err := filecache.Set(symbolsKind, key, data); err != nil {
 					event.Error(ctx, fmt.Sprintf("storing symbol data for %s", id), err)
 				}
@@ -73,7 +74,7 @@ func (s *Snapshot) Symbols(ctx context.Context, ids ...PackageID) ([]*symbols.Pa
 	return res, g.Wait()
 }
 
-func symbolKey(ctx context.Context, mp *metadata.Package, fs file.Source) (file.Hash, []file.Handle, error) {
+func symbolKey(ctx context.Context, mp *metadata.Package, fs file.Source, root rootMapper) (file.Hash, []file.Handle, error) {
 	seen := make(map[protocol.DocumentURI]bool)
 	var fhs []file.Handle
 	for _, list := range [][]protocol.DocumentURI{mp.GoFiles, mp.CompiledGoFiles} {
@@ -93,7 +94,7 @@ func symbolKey(ctx context.Context, mp *metadata.Package, fs file.Source) (file.
 	fmt.Fprintf(hasher, "symbols: %s\n", mp.PkgPath)
 	fmt.Fprintf(hasher, "files: %d\n", len(fhs))
 	for _, fh := range fhs {
-		fmt.Fprintln(hasher, fh.Identity())
+		fmt.Fprintln(hasher, root.fileKey(fh))
 	}
 	var hash file.Hash
 	hasher.Sum(hash[:0])

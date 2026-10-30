@@ -325,7 +325,7 @@ func (b *typeCheckBatch) getImportPackage(ctx context.Context, id PackageID) (pk
 		}
 
 		if data, ok := filecache.GetOrFatal(exportDataKind, ph.key, filecache.Bytes); ok {
-			return b.importPackage(ctx, ph.mp, data)
+			return b.importPackage(ctx, ph.mp, ph.localInputs.root, data)
 		}
 		// No cached export data (or hit error): type-check as fast as possible.
 		return b.checkPackageForImport(ctx, ph)
@@ -427,15 +427,18 @@ func (b *typeCheckBatch) getPackage(ctx context.Context, ph *packageHandle) (*Pa
 // file cache.
 // The context is used only for logging; cancellation does not affect the operation.
 func storePackageResults(ctx context.Context, ph *packageHandle, p *Package, enc *objectpath.Encoder) {
+	// The key is location-independent (see rootMapper), so values must
+	// be too. (xrefs are already: they record file indices, not names.)
+	root := ph.localInputs.root
 	toCache := map[string][]byte{
 		xrefsKind:       p.pkg.xrefs(enc).Encode(),
-		methodSetsKind:  p.pkg.methodsets(enc).Encode(),
-		testsKind:       p.pkg.tests().Encode(),
-		diagnosticsKind: encodeDiagnostics(p.pkg.diagnostics),
+		methodSetsKind:  p.pkg.methodsets(enc).Rename(root.encPath).Encode(),
+		testsKind:       p.pkg.tests().Rename(root.encURI).Encode(),
+		diagnosticsKind: encodeDiagnostics(p.pkg.diagnostics, root),
 	}
 
 	if p.metadata.PkgPath != "unsafe" { // unsafe cannot be exported
-		exportData, err := gcimporter.IExportShallow(p.pkg.fset, p.pkg.types, bug.Reportf)
+		exportData, err := gcimporter.IExportShallowRenamed(p.pkg.fset, p.pkg.types, bug.Reportf, root.encPath)
 		if err != nil {
 			bug.Reportf("exporting package %v: %v", p.metadata.ID, err)
 		} else {
@@ -461,7 +464,9 @@ func (b *typeCheckBatch) Metadata(id PackageID) *metadata.Package {
 
 // importPackage loads the given package from its export data in p.exportData
 // (which must already be populated).
-func (b *typeCheckBatch) importPackage(ctx context.Context, mp *metadata.Package, data []byte) (*types.Package, error) {
+//
+// File names in data are in location-independent form; root maps them back.
+func (b *typeCheckBatch) importPackage(ctx context.Context, mp *metadata.Package, root rootMapper, data []byte) (*types.Package, error) {
 	ctx, done := event.Start(ctx, "cache.typeCheckBatch.importPackage", label.Package.Of(string(mp.ID)))
 	defer done()
 
@@ -580,7 +585,7 @@ func (b *typeCheckBatch) importPackage(ctx context.Context, mp *metadata.Package
 		return nil, ctx.Err()
 	}
 
-	imported, err := gcimporter.IImportShallow(b.fset, getPackages, data, string(mp.PkgPath), bug.Reportf)
+	imported, err := gcimporter.IImportShallowRenamed(b.fset, getPackages, data, string(mp.PkgPath), bug.Reportf, root.decPath)
 	if err != nil {
 		return nil, fmt.Errorf("import failed for %q: %v", mp.ID, err)
 	}
@@ -648,7 +653,7 @@ func (b *typeCheckBatch) checkPackageForImport(ctx context.Context, ph *packageH
 
 	// Asynchronously record export data.
 	go func() {
-		exportData, err := gcimporter.IExportShallow(b.fset, pkg, bug.Reportf)
+		exportData, err := gcimporter.IExportShallowRenamed(b.fset, pkg, bug.Reportf, ph.localInputs.root.encPath)
 		if err != nil {
 			// Internal error; the stack will have been reported via
 			// bug.Reportf within IExportShallow, so there's not much
@@ -1391,7 +1396,7 @@ func (s *Snapshot) typerefs(ctx context.Context, mp *metadata.Package, cgfs []fi
 		}
 	}
 
-	data, err := s.typerefData(ctx, mp.ID, imports, cgfs)
+	data, err := s.typerefData(ctx, mp.ID, imports, cgfs, s.rootMapper())
 	if err != nil {
 		return nil, err
 	}
@@ -1407,8 +1412,8 @@ func (s *Snapshot) typerefs(ctx context.Context, mp *metadata.Package, cgfs []fi
 
 // typerefData retrieves encoded typeref data from the filecache, or computes it on
 // a cache miss.
-func (s *Snapshot) typerefData(ctx context.Context, id PackageID, imports map[ImportPath]*metadata.Package, cgfs []file.Handle) ([]byte, error) {
-	key := typerefsKey(id, imports, cgfs)
+func (s *Snapshot) typerefData(ctx context.Context, id PackageID, imports map[ImportPath]*metadata.Package, cgfs []file.Handle, root rootMapper) ([]byte, error) {
+	key := typerefsKey(id, imports, cgfs, root)
 	if data, ok := filecache.GetOrFatal(typerefsKind, key, filecache.Bytes); ok {
 		return data, nil
 	}
@@ -1430,8 +1435,8 @@ func (s *Snapshot) typerefData(ctx context.Context, id PackageID, imports map[Im
 }
 
 // typerefsKey produces a key for the reference information produced by the
-// typerefs package.
-func typerefsKey(id PackageID, imports map[ImportPath]*metadata.Package, compiledGoFiles []file.Handle) file.Hash {
+// typerefs package. (The data itself contains no file names.)
+func typerefsKey(id PackageID, imports map[ImportPath]*metadata.Package, compiledGoFiles []file.Handle, root rootMapper) file.Hash {
 	hasher := sha256.New()
 
 	fmt.Fprintf(hasher, "typerefs: %s\n", id)
@@ -1444,7 +1449,7 @@ func typerefsKey(id PackageID, imports map[ImportPath]*metadata.Package, compile
 
 	fmt.Fprintf(hasher, "compiledGoFiles: %d\n", len(compiledGoFiles))
 	for _, fh := range compiledGoFiles {
-		fmt.Fprintln(hasher, fh.Identity())
+		fmt.Fprintln(hasher, root.fileKey(fh))
 	}
 
 	var hash [sha256.Size]byte
@@ -1475,6 +1480,10 @@ type typeCheckInputs struct {
 	supportsRelatedInformation bool
 	linkTarget                 string
 	viewType                   ViewType
+
+	// root maps file names to and from the location-independent form
+	// used in cache keys and values. It is not itself part of the key.
+	root rootMapper
 }
 
 func (s *Snapshot) typeCheckInputs(ctx context.Context, mp *metadata.Package) (*typeCheckInputs, error) {
@@ -1523,6 +1532,7 @@ func (s *Snapshot) typeCheckInputs(ctx context.Context, mp *metadata.Package) (*
 		supportsRelatedInformation: s.Options().RelatedInformationSupported,
 		linkTarget:                 s.Options().LinkTarget,
 		viewType:                   s.view.typ,
+		root:                       s.rootMapper(),
 	}, nil
 }
 
@@ -1560,17 +1570,18 @@ func localPackageKey(inputs *typeCheckInputs) file.Hash {
 	}
 
 	// file names and contents
+	// (Names are relative to the view root, if under it; see rootMapper.)
 	fmt.Fprintf(hasher, "compiledGoFiles: %d\n", len(inputs.compiledGoFiles))
 	for _, fh := range inputs.compiledGoFiles {
-		fmt.Fprintln(hasher, fh.Identity())
+		fmt.Fprintln(hasher, inputs.root.fileKey(fh))
 	}
 	fmt.Fprintf(hasher, "goFiles: %d\n", len(inputs.goFiles))
 	for _, fh := range inputs.goFiles {
-		fmt.Fprintln(hasher, fh.Identity())
+		fmt.Fprintln(hasher, inputs.root.fileKey(fh))
 	}
 	fmt.Fprintf(hasher, "asmFiles: %d\n", len(inputs.asmFiles))
 	for _, fh := range inputs.asmFiles {
-		fmt.Fprintln(hasher, fh.Identity())
+		fmt.Fprintln(hasher, inputs.root.fileKey(fh))
 	}
 
 	// types sizes
