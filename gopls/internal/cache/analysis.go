@@ -421,6 +421,7 @@ func (s *Snapshot) Analyze(ctx context.Context, pkgs map[PackageID]*metadata.Pac
 				continue // action failed
 			}
 			for _, gobDiag := range summary.Diagnostics {
+				gobDiag := root.ph.localInputs.root.decDiagnostic(gobDiag)
 				results = append(results, toSourceDiagnostic(srcAnalyzer, &gobDiag))
 			}
 		}
@@ -507,10 +508,10 @@ type actionMap map[string]*actionSummary
 // actionSummary is a frob-serializable summary of one possibly failed analysis action.
 // If Err is non-empty, the other fields are undefined.
 type actionSummary struct {
-	Facts       []byte    // the encoded facts.Set
-	FactsHash   file.Hash // hash(Facts)
-	Diagnostics []gobDiagnostic
-	Err         string // "" => success
+	Facts       []byte          // the encoded facts.Set
+	FactsHash   file.Hash       // hash(Facts)
+	Diagnostics []gobDiagnostic // in location-independent form (see rootMapper)
+	Err         string          // "" => success
 }
 
 var (
@@ -737,6 +738,7 @@ filterErrors:
 		typeErrors:   typeErrors,
 		compiles:     compiles,
 		factsDecoder: factsDecoder,
+		root:         an.ph.localInputs.root,
 	}, nil
 }
 
@@ -804,6 +806,7 @@ type analysisPackage struct {
 	typeErrors   []types.Error // filtered type checker errors
 	compiles     bool          // package is transitively free of list/parse/type errors
 	factsDecoder *facts.Decoder
+	root         rootMapper // for location-independent diagnostics (see actionSummary)
 }
 
 // An action represents one unit of analysis work: the application of
@@ -993,7 +996,7 @@ func (act *action) exec(ctx context.Context) (any, *actionSummary, error) {
 				event.Error(ctx, fmt.Sprintf("internal error converting diagnostic from analyzer %q", analyzer.Name), err)
 				return
 			}
-			diagnostics = append(diagnostics, diagnostic)
+			diagnostics = append(diagnostics, apkg.root.encDiagnostic(diagnostic))
 		},
 		ImportObjectFact:  factset.ImportObjectFact,
 		ExportObjectFact:  factset.ExportObjectFact,

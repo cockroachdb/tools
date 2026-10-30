@@ -10,6 +10,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/gopls/internal/cache/parsego"
@@ -42,6 +43,24 @@ var codec = frob.CodecFor[*Package]()
 // Decode decodes data from [Package.Encode].
 func Decode(data []byte) *Package {
 	return codec.Decode(data)
+}
+
+// Rename returns a package in which each file URI is replaced by
+// rename(uri). It returns the receiver if no URI changes.
+func (p *Package) Rename(rename func(protocol.DocumentURI) protocol.DocumentURI) *Package {
+	var files []protocol.DocumentURI // copy of p.Files, allocated on first change
+	for i, uri := range p.Files {
+		if uri2 := rename(uri); uri2 != uri {
+			if files == nil {
+				files = slices.Clone(p.Files)
+			}
+			files[i] = uri2
+		}
+	}
+	if files == nil {
+		return p
+	}
+	return &Package{Files: files, Symbols: p.Symbols}
 }
 
 // Encode encodes the package.

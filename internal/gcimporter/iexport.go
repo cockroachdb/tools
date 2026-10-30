@@ -277,6 +277,15 @@ import (
 // to obtain via telemetry the stack that would otherwise be lost by
 // merely returning an error.
 func IExportShallow(fset *token.FileSet, pkg *types.Package, reportf ReportFunc) ([]byte, error) {
+	return IExportShallowRenamed(fset, pkg, reportf, nil)
+}
+
+// IExportShallowRenamed is like [IExportShallow], but records the name
+// of each file as rename(name), if rename is non-nil. It allows a
+// client to store file names in a location-independent form (for
+// example relative to a workspace root); the inverse mapping must then
+// be supplied to [IImportShallowRenamed].
+func IExportShallowRenamed(fset *token.FileSet, pkg *types.Package, reportf ReportFunc, rename func(string) string) ([]byte, error) {
 	// In principle this operation can only fail if out.Write fails,
 	// but that's impossible for bytes.Buffer---and as a matter of
 	// fact iexportCommon doesn't even check for I/O errors.
@@ -284,7 +293,7 @@ func IExportShallow(fset *token.FileSet, pkg *types.Package, reportf ReportFunc)
 	// TODO(adonovan): use byte slices throughout, avoiding copying.
 	const shallow = true
 	var out bytes.Buffer
-	err := iexportCommon(&out, fset, shallow, iexportVersion, []*types.Package{pkg}, reportf)
+	err := iexportCommon(&out, fset, shallow, iexportVersion, []*types.Package{pkg}, reportf, rename)
 	return out.Bytes(), err
 }
 
@@ -301,8 +310,15 @@ func IExportShallow(fset *token.FileSet, pkg *types.Package, reportf ReportFunc)
 // TODO(rfindley): remove reportf when we are confident enough in the new
 // objectpath encoding.
 func IImportShallow(fset *token.FileSet, getPackages GetPackagesFunc, data []byte, path string, reportf ReportFunc) (*types.Package, error) {
+	return IImportShallowRenamed(fset, getPackages, data, path, reportf, nil)
+}
+
+// IImportShallowRenamed is like [IImportShallow], but names each
+// imported file rename(name), if rename is non-nil, where name is the
+// file name recorded by [IExportShallowRenamed].
+func IImportShallowRenamed(fset *token.FileSet, getPackages GetPackagesFunc, data []byte, path string, reportf ReportFunc, rename func(string) string) (*types.Package, error) {
 	const shallow = true
-	pkgs, err := iimportCommon(fset, getPackages, data, path, shallow, reportf)
+	pkgs, err := iimportCommon(fset, getPackages, data, path, shallow, reportf, rename)
 	if err != nil {
 		return nil, err
 	}
@@ -319,10 +335,10 @@ type ReportFunc = func(string, ...any)
 // so that calls to IImportData can override with a provided package path.
 func IExportData(out io.Writer, fset *token.FileSet, pkg *types.Package) error {
 	const shallow = false
-	return iexportCommon(out, fset, shallow, iexportVersion, []*types.Package{pkg}, nil)
+	return iexportCommon(out, fset, shallow, iexportVersion, []*types.Package{pkg}, nil, nil)
 }
 
-func iexportCommon(out io.Writer, fset *token.FileSet, shallow bool, version int, pkgs []*types.Package, reportf ReportFunc) (err error) {
+func iexportCommon(out io.Writer, fset *token.FileSet, shallow bool, version int, pkgs []*types.Package, reportf ReportFunc, rename func(string) string) (err error) {
 	if !debug {
 		defer func() {
 			if e := recover(); e != nil {
@@ -353,6 +369,7 @@ func iexportCommon(out io.Writer, fset *token.FileSet, shallow bool, version int
 		tparamNames: map[types.Object]string{},
 		typIndex:    map[types.Type]uint64{},
 		localpkg:    pkgs[0],
+		rename:      rename,
 	}
 
 	for i, pt := range predeclared() {
@@ -424,7 +441,11 @@ func iexportCommon(out io.Writer, fset *token.FileSet, shallow bool, version int
 func (p *iexporter) encodeFile(w *intWriter, file *token.File, needed []uint64) {
 	_ = needed[0] // precondition: needed is non-empty
 
-	w.uint64(p.stringOff(file.Name()))
+	name := file.Name()
+	if p.rename != nil {
+		name = p.rename(name)
+	}
+	w.uint64(p.stringOff(name))
 
 	size := uint64(file.Size())
 	w.uint64(size)
@@ -536,6 +557,7 @@ type iexporter struct {
 	version int
 
 	shallow    bool                // don't put types from other packages in the index
+	rename     func(string) string // if non-nil, maps file names before encoding (shallow mode only)
 	objEncoder *objectpath.Encoder // encodes objects from other packages in shallow mode; lazily allocated
 	localpkg   *types.Package
 
