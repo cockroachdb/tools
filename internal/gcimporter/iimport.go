@@ -106,7 +106,7 @@ const (
 // If the export data version is not recognized or the format is otherwise
 // compromised, an error is returned.
 func IImportData(fset *token.FileSet, imports map[string]*types.Package, data []byte, path string) (*types.Package, error) {
-	pkgs, err := iimportCommon(fset, GetPackagesFromMap(imports), data, path, false, nil)
+	pkgs, err := iimportCommon(fset, GetPackagesFromMap(imports), data, path, false, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func GetPackagesFromMap(m map[string]*types.Package) GetPackagesFunc {
 	}
 }
 
-func iimportCommon(fset *token.FileSet, getPackages GetPackagesFunc, data []byte, path string, shallow bool, reportf ReportFunc) (pkgs []*types.Package, err error) {
+func iimportCommon(fset *token.FileSet, getPackages GetPackagesFunc, data []byte, path string, shallow bool, reportf ReportFunc, rename func(string) string) (pkgs []*types.Package, err error) {
 	const currentVersion = iexportVersionCurrent
 	version := int64(-1)
 	if !debug {
@@ -206,6 +206,7 @@ func iimportCommon(fset *token.FileSet, getPackages GetPackagesFunc, data []byte
 		ipath:   path,
 		shallow: shallow,
 		reportf: reportf,
+		rename:  rename,
 
 		stringData:  stringData,
 		stringCache: make(map[uint64]string),
@@ -351,7 +352,8 @@ type iimporter struct {
 	ipath   string
 
 	shallow bool
-	reportf ReportFunc // if non-nil, used to report bugs
+	reportf ReportFunc          // if non-nil, used to report bugs
+	rename  func(string) string // if non-nil, maps file names after decoding (shallow mode only)
 
 	stringData  []byte
 	stringCache map[uint64]string
@@ -444,6 +446,9 @@ func (p *iimporter) fileAt(index uint64) *token.File {
 
 func (p *iimporter) decodeFile(rd intReader) *token.File {
 	filename := p.stringAt(rd.uint64())
+	if p.rename != nil {
+		filename = p.rename(filename)
+	}
 	size := int(rd.uint64())
 	file := p.fake.fset.AddFile(filename, -1, size)
 

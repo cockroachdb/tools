@@ -155,8 +155,9 @@ func editGoDirectiveQuickFix(haveModule bool, uri protocol.DocumentURI, version 
 	return []SuggestedFix{SuggestedFixFromCommand(cmd, protocol.QuickFix)}
 }
 
-// encodeDiagnostics gob-encodes the given diagnostics.
-func encodeDiagnostics(srcDiags []*Diagnostic) []byte {
+// encodeDiagnostics gob-encodes the given diagnostics,
+// in the location-independent form defined by root.
+func encodeDiagnostics(srcDiags []*Diagnostic, root rootMapper) []byte {
 	var gobDiags []gobDiagnostic
 	for _, srcDiag := range srcDiags {
 		var gobFixes []gobSuggestedFix
@@ -198,16 +199,22 @@ func encodeDiagnostics(srcDiags []*Diagnostic) []byte {
 			Related:        gobRelated,
 			Tags:           srcDiag.Tags,
 		}
-		gobDiags = append(gobDiags, gobDiag)
+		gobDiags = append(gobDiags, root.encDiagnostic(gobDiag))
 	}
 	return diagnosticsCodec.Encode(gobDiags)
 }
 
 // decodeDiagnostics decodes the given gob-encoded diagnostics.
-func decodeDiagnostics(data []byte) []*Diagnostic {
-	gobDiags := diagnosticsCodec.Decode(data)
+func decodeDiagnostics(data []byte, root rootMapper) []*Diagnostic {
+	return fromGobDiagnostics(diagnosticsCodec.Decode(data), root)
+}
+
+// fromGobDiagnostics converts diagnostics from the serializable,
+// location-independent form produced by [encodeDiagnostics].
+func fromGobDiagnostics(gobDiags []gobDiagnostic, root rootMapper) []*Diagnostic {
 	var srcDiags []*Diagnostic
 	for _, gobDiag := range gobDiags {
+		gobDiag := root.decDiagnostic(gobDiag)
 		var srcFixes []SuggestedFix
 		for _, gobFix := range gobDiag.SuggestedFixes {
 			srcFix := SuggestedFix{

@@ -123,8 +123,8 @@ func TestDiagnosticEncoding(t *testing.T) {
 		},
 	}
 
-	data := encodeDiagnostics(diags)
-	diags2 := decodeDiagnostics(data)
+	data := encodeDiagnostics(diags, rootMapper{})
+	diags2 := decodeDiagnostics(data, rootMapper{})
 
 	if diff := cmp.Diff(diags, diags2); diff != "" {
 		t.Errorf("decoded diagnostics do not match (-original +decoded):\n%s", diff)
