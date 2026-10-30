@@ -262,3 +262,21 @@ func BenchmarkUncontendedSet(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkSetFresh measures the cost of Set for entries that are in
+// neither the in-memory cache nor the file system, as when gopls
+// populates an empty cache. Use -cpu to vary the concurrency.
+func BenchmarkSetFresh(b *testing.B) {
+	const kind = "BenchmarkSetFresh"
+	b.SetBytes(4096)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			key := uniqueKey()
+			value := make([]byte, 4096)
+			copy(value, key[:]) // distinct values, so the CAS file is new too
+			if err := filecache.Set(kind, key, value); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
