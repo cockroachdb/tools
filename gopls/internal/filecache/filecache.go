@@ -180,7 +180,7 @@ func get(kind string, key [32]byte) ([]byte, error) {
 	if err != nil {
 		return nil, err // (ErrNoCache)
 	}
-	indexData, err := os.ReadFile(indexName)
+	indexData, indexMtime, err := readFile(indexName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrNotFound
@@ -201,7 +201,7 @@ func get(kind string, key [32]byte) ([]byte, error) {
 	if err != nil {
 		return nil, err // (ErrNoCache)
 	}
-	value, _ := os.ReadFile(casName) // ignore error
+	value, casMtime, _ := readFile(casName) // ignore error
 	if sha256.Sum256(value) != valueHash {
 		return nil, ErrNotFound // CAS file is missing or has wrong contents
 	}
@@ -217,7 +217,8 @@ func get(kind string, key [32]byte) ([]byte, error) {
 	// automatically, but for efficiency most POSIX systems have
 	// for many years set the noatime mount option to avoid every
 	// open or read operation entailing a metadata write.)
-	touch(indexName, casName)
+	touch(indexName, indexMtime)
+	touch(casName, casMtime)
 
 	return value, nil
 }
@@ -242,15 +243,6 @@ func Set(kind string, key [32]byte, value []byte) error {
 	iolimit <- struct{}{}        // acquire a token
 	defer func() { <-iolimit }() // release a token
 
-	// TODO(adonovan): opt: reduce the ~10 metadata syscalls per Set,
-	// which are costly on macOS (APFS updates the Spotlight index,
-	// and many companies install endpoint security clients that
-	// intercept file I/O). We could:
-	// - remember which of the 256 "XX/" directories exist, to avoid MkdirAll;
-	// - skip touch(casName) when we just created the CAS file;
-	// - replace the ReadFile+Equal probe with something cheaper
-	//   (e.g. Stat+size check, or O_EXCL create).
-
 	// First, add the value to the content-
 	// addressable store (CAS), if not present.
 	hash := sha256.Sum256(value)
@@ -258,18 +250,33 @@ func Set(kind string, key [32]byte, value []byte) error {
 	if err != nil {
 		return err // (ErrNoCache)
 	}
-	// Does CAS file exist and have correct (complete) content?
-	// TODO(adonovan): opt: use mmap for this check.
-	if prev, _ := os.ReadFile(casName); !bytes.Equal(prev, value) {
-		if err := os.MkdirAll(filepath.Dir(casName), 0700); err != nil {
-			return err
-		}
-		// Avoiding O_TRUNC here is merely an optimization to avoid
-		// cache misses when two threads race to write the same file.
-		if err := writeFileNoTrunc(casName, value, 0600); err != nil {
+	// Syscalls are costly on macOS (APFS updates the Spotlight index,
+	// and many companies install endpoint security clients that
+	// intercept file I/O), so Set avoids probing and truncating:
+	// it creates each file exclusively, which usually succeeds.
+	switch err := writeNewFile(casName, value); {
+	case err == nil:
+		// We created the file, so its contents are what we wrote
+		// (a failed write removes it), and its timestamp is fresh.
+
+	case errors.Is(err, fs.ErrExist):
+		// The CAS file already exists, but may be incomplete or corrupt
+		// (e.g. its writer was killed or the disk filled up). Since
+		// that would make every Get of this value fail indefinitely,
+		// we must not skip this full check of its contents, nor
+		// replace it with a cheaper one such as a size check.
+		// TODO(adonovan): opt: use mmap for this check.
+		prev, mtime, _ := readFile(casName)
+		if bytes.Equal(prev, value) {
+			// Update the timestamp to prevent premature LRU eviction.
+			touch(casName, mtime)
+		} else if err := writeFileNoTrunc(casName, value, 0600); err != nil {
 			os.Remove(casName) // ignore error
 			return err         // e.g. disk full
 		}
+
+	default:
+		return err // e.g. disk full
 	}
 
 	// Now write an index entry that refers to the CAS file.
@@ -277,27 +284,45 @@ func Set(kind string, key [32]byte, value []byte) error {
 	if err != nil {
 		return err // (ErrNoCache)
 	}
-	if err := os.MkdirAll(filepath.Dir(indexName), 0700); err != nil {
-		return err // e.g. disk full
+	err = writeNewFile(indexName, hash[:])
+	if errors.Is(err, fs.ErrExist) {
+		// Replace the existing entry.
+		if err = writeFileNoTrunc(indexName, hash[:], 0600); err != nil {
+			os.Remove(indexName) // ignore error
+		}
 	}
-	if err := writeFileNoTrunc(indexName, hash[:], 0600); err != nil {
-		os.Remove(indexName) // ignore error
-		return err           // e.g. disk full
-	}
-
-	// Update the CAS file's timestamp to prevent premature LRU eviction.
-	touch(casName)
-
-	return nil
+	return err // e.g. disk full
 }
 
-func touch(filenames ...string) {
+// readFile is like [os.ReadFile] but also returns the file's
+// modification time, saving the cost of a separate stat by name.
+func readFile(name string) ([]byte, time.Time, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	// If a concurrent writer changes the size, the caller sees
+	// a short or garbled value, which is no different from
+	// observing the file mid-write.
+	data := make([]byte, st.Size())
+	n, err := io.ReadFull(f, data)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		err = nil // file shrank
+	}
+	return data[:n], st.ModTime(), err
+}
+
+// touch updates the times of the named file, whose current
+// modification time is mtime, if they are more than an hour old.
+func touch(filename string, mtime time.Time) {
 	now := time.Now()
-	for _, filename := range filenames {
-		st, err := os.Stat(filename)
-		if err == nil && now.Sub(st.ModTime()) > time.Hour {
-			os.Chtimes(filename, now, now) // ignore error
-		}
+	if now.Sub(mtime) > time.Hour {
+		os.Chtimes(filename, now, now) // ignore error
 	}
 }
 
@@ -318,6 +343,40 @@ func writeFileNoTrunc(filename string, data []byte, perm os.FileMode) error {
 	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
+	}
+	return err
+}
+
+// writeNewFile creates the named file and writes data to it.
+// If the file already exists, it fails with an error satisfying
+// errors.Is(err, fs.ErrExist) and does not modify it.
+// If the write fails, the file is removed.
+//
+// It creates the parent directory only if needed, rather than
+// checking for it beforehand at the cost of a syscall per call.
+// This happens on the first use of each of the 256 "XX/" directories,
+// or after the garbage collector (possibly of another process) has
+// deleted one.
+func writeNewFile(filename string, data []byte) error {
+	const flag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	f, err := os.OpenFile(filename, flag, 0600)
+	if errors.Is(err, fs.ErrNotExist) {
+		// Retry just once: if the GC deletes the directory again
+		// before we use it, the Set fails and the entry is not
+		// cached, as for other I/O errors.
+		if err = os.MkdirAll(filepath.Dir(filename), 0700); err == nil {
+			f, err = os.OpenFile(filename, flag, 0600)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(filename) // ignore error
 	}
 	return err
 }
